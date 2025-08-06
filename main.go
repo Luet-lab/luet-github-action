@@ -1,10 +1,13 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +20,7 @@ import (
 	utils "github.com/mudler/luet/pkg/api/client/utils"
 	"github.com/mudler/luet/pkg/api/core/types"
 	"github.com/mudler/luet/pkg/installer"
+	"github.com/sethvargo/go-githubactions"
 )
 
 type opData struct {
@@ -26,6 +30,50 @@ type opData struct {
 type resultData struct {
 	Package luetClient.Package
 	Exists  bool
+}
+
+type matrix map[string][]string
+
+func (m *matrix) Add(key, value string) {
+	if _, ok := (*m)[key]; !ok {
+		(*m)[key] = []string{}
+	}
+	(*m)[key] = append((*m)[key], value)
+}
+
+func (m *matrix) String() string {
+	s, _ := json.Marshal(m)
+	return string(s)
+}
+
+// github has a limit of 256 jobs per workflow run
+func ensurePackageMatrixLimit(m *matrix) {
+	// use 250 for safety. 256 is the actual limit.
+	if len((*m)["package"]) <= 250 {
+		return
+	}
+
+	packages := []string{}
+	// put first 250 packages in the matrix
+	for i := 0; i < 250; i++ {
+		packages = append(packages, (*m)["package"][i])
+	}
+
+	// put the rest in at idx mod 250 and merge with existing packages using space separator
+	for i := 250; i < len((*m)["package"]); i++ {
+		packages[i%250] = strings.Join([]string{packages[i%250], (*m)["package"][i]}, " ")
+	}
+
+	(*m)["package"] = packages
+}
+
+func matchPackages(currentPackage string, p client.Package) bool {
+	if currentPackage == "" {
+		return true
+	}
+
+	cps := strings.Split(currentPackage, " ")
+	return slices.ContainsFunc(cps, p.EqualSV)
 }
 
 // The action can:
@@ -51,6 +99,10 @@ var onlyMissing = flag.Bool("onlyMissing", false, "Build only missing packages")
 var push = flag.Bool("pushCache", false, "Pushing cache images while building")
 var pushFinalImages = flag.Bool("pushFinalImages", false, "Pushing final images while building")
 var pushFinalImagesRepository = flag.String("pushFinalImagesRepository", "", "Specify a different final repo")
+
+var keepImages = flag.Bool("keepImages", true, "Keep built docker images in the host")
+
+var pretend = flag.Bool("pretend", false, "Pretend to build")
 
 var tree = flag.String("tree", "${PWD}/packages", "create repository")
 var platform = flag.String("platform", "", "buildx platform")
@@ -114,10 +166,13 @@ func main() {
 	utils.RunSH("dependencies", "curl -L https://raw.githubusercontent.com/mocaccinoOS/repository-index/master/packages/luet.yml --output /etc/luet/repos.conf.d/luet.yml")
 
 	if dockerUsername != "" && dockerPassword != "" {
-		out, err := utils.RunSHOUT("login", fmt.Sprintf(
-			"echo %s | docker login -u '%s' --password-stdin '%s'",
-			dockerPassword, dockerUsername, dockerEndpoint),
-		)
+		cmd := fmt.Sprintf("echo %s | docker login -u '%s' --password-stdin '%s'", dockerPassword, dockerUsername, dockerEndpoint)
+		if _, err := base64.StdEncoding.DecodeString(dockerPassword); err == nil {
+			cmd = fmt.Sprintf("echo '%s' | base64 -d | docker login -u %s --password-stdin %s", dockerPassword, dockerUsername, dockerEndpoint)
+			fmt.Println("Docker password is base64 encoded")
+		}
+
+		out, err := utils.RunSHOUT("login", cmd)
 		if err != nil {
 			fmt.Println(string(out))
 			os.Exit(1)
@@ -226,6 +281,8 @@ func build() {
 	packs, err := luetClient.TreePackages(*tree)
 	checkErr(err)
 
+	packages := []client.Package{}
+
 	if *fromIndex {
 		currentPackages := repositoryPackages(finalRepo)
 		missingPackages := []client.Package{}
@@ -250,19 +307,26 @@ func build() {
 			fmt.Println("-", m.String())
 		}
 
-		for _, p := range missingPackages {
-			buildPackage(p.String())
-		}
-
-		return
-	}
-
-	for _, p := range packs.Packages {
-		if ((*onlyMissing && !p.ImageAvailable(finalRepo)) || !*onlyMissing) &&
-			(currentPackage != "" && p.EqualSV(currentPackage) || currentPackage == "") {
-			buildPackage(p.String())
+		packages = append(packages, missingPackages...)
+	} else {
+		for _, p := range packs.Packages {
+			if ((*onlyMissing && !p.ImageAvailable(finalRepo)) || !*onlyMissing) && matchPackages(currentPackage, p) {
+				packages = append(packages, p)
+			}
 		}
 	}
+
+	packagesMatrix := matrix{}
+
+	for _, p := range packages {
+		packagesMatrix.Add("package", p.String())
+		if !*pretend {
+			buildPackage(p.String())
+		}
+	}
+
+	ensurePackageMatrixLimit(&packagesMatrix)
+	githubactions.SetOutput("matrix_jobs", packagesMatrix.String())
 
 	utils.RunSH("build perms", "chmod -R 777 "+*outputdir)
 }
@@ -307,6 +371,10 @@ func buildPackage(s string) {
 
 	if *pushFinalImagesRepository != "" {
 		args = append(args, "--push-final-images-repository", *pushFinalImagesRepository)
+	}
+
+	if *keepImages {
+		args = append(args, "--keep-images")
 	}
 
 	if finalRepo != "" {
